@@ -1,0 +1,336 @@
+--- a/net/minecraft/server/level/ServerChunkCache.java
++++ b/net/minecraft/server/level/ServerChunkCache.java
+@@ -58,9 +_,31 @@
+     private boolean spawnEnemies = true;
+     private boolean spawnFriendlies = true;
+     private static final int CACHE_SIZE = 4;
+-    private final long[] lastChunkPos = new long[4];
+-    private final ChunkStatus[] lastChunkStatus = new ChunkStatus[4];
+-    private final ChunkAccess[] lastChunk = new ChunkAccess[4];
++    // MCMT hook: the recently-used chunk cache. Vanilla keeps three parallel arrays here; folding each slot
++    // into one immutable ChunkCacheEntry makes a slot read atomic, so a worker can never match a position
++    // whose chunk has already been replaced and come away with the wrong chunk. See ChunkCacheEntry.
++    private final java.util.concurrent.atomic.AtomicReferenceArray<net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry> lastChunks = new java.util.concurrent.atomic.AtomicReferenceArray<>(
++        4
++    );
++    // MCMT hook: the shared cache above has four slots. Under MCMT, 32 workers evict each other's entries on
++    // every miss, so it almost never hits and nearly every getChunk falls through to mcmtChunkLoadLock -- a
++    // 32-worker jstack put about 72% of engaged worker time on that lock. Give each pool worker its own slots
++    // instead, so its own working set stays cached and a hit skips the lock entirely. An entry is valid until
++    // the next clearCache(), exactly as a shared-cache entry is: clearCache() bumps mcmtCacheVersion, and an
++    // entry records the version it was stored at. Only FULL chunks are cached, and only for pool threads --
++    // the server thread keeps the shared cache, which suits it because it is single-threaded.
++    private final java.util.concurrent.atomic.AtomicLong mcmtCacheVersion = new java.util.concurrent.atomic.AtomicLong();
++    private final ThreadLocal<net.neoforged.neoforge.mcmt.parallel.ThreadChunkCache> mcmtLocalChunkCache = ThreadLocal.withInitial(
++        net.neoforged.neoforge.mcmt.parallel.ThreadChunkCache::new
++    );
++
++    // MCMT hook: serialises mutation of the chunk map on the cache-miss path. getChunkFutureMainThread walks
++    // ChunkMap and DistanceManager and the executor pump runs runDistanceManagerUpdates, none of which tolerate
++    // concurrent callers -- so a worker holds this while creating a load future or running one pump iteration,
++    // but not across the wait for async generation in between (MCMT-PLAN §4c / §4i, mcmtPumpUntil). Pool workers
++    // only ever take it with tryLock (mcmtLockCooperatively) and park on failure, so contention here cannot
++    // inflate the worker pool. That is no worse than vanilla, where all chunk loading is on the server thread.
++    private final java.util.concurrent.locks.ReentrantLock mcmtChunkLoadLock = new java.util.concurrent.locks.ReentrantLock();
+     @Nullable
+     @VisibleForDebug
+     private NaturalSpawner.SpawnState lastSpawnState;
+@@ -110,6 +_,80 @@
+         return this.lightEngine;
+     }
+ 
++    /**
++     * MCMT hook H5: whether the calling thread may drive this chunk source directly.
++     *
++     * <p>The three call sites that consult this all branch on "am I the main thread?", and the off-thread
++     * branch posts the work to {@link #mainThreadProcessor} and joins the result. Under MCMT the main thread is
++     * parked on the tick barrier for the whole of {@code tickChildren} and will never run that work, so a tick
++     * worker taking the off-thread branch deadlocks. The main-thread branch instead drains the queue itself
++     * (see {@link #mcmtPumpUntil}), which is what a worker needs.
++     *
++     * <p>Several workers may hold this at once, so the paths they take have to tolerate it: the recently-used
++     * cache is an atomic array of immutable entries, and every mutation of the chunk map on the cache-miss path
++     * is serialised by {@link #mcmtChunkLoadLock}.
++     */
++    private boolean mcmtCanDriveDirectly() {
++        return Thread.currentThread() == this.mainThread || net.neoforged.neoforge.mcmt.MCMT.isPoolThread();
++    }
++
++    /**
++     * MCMT: wait until {@code done} while cooperatively pumping {@link #mainThreadProcessor}, holding
++     * {@link #mcmtChunkLoadLock} for only one {@code pollTask} at a time (MCMT-PLAN §4c).
++     *
++     * <p>This replaces {@code mainThreadProcessor.managedBlock(done)} for callers that hold -- or have just
++     * released -- the load lock. {@code managedBlock} would pump the executor while the caller kept the lock for
++     * the entire wait, blocking every other loader for the duration and, on a pool worker, growing a
++     * compensation thread per blocked acquisition. Here the lock is taken per pump iteration via
++     * {@code tryLock}: exactly one worker mutates {@code ChunkMap} / {@code DistanceManager} at any instant, but
++     * that single pump advances the futures of <em>all</em> waiters, and a worker that fails {@code tryLock}
++     * parks briefly (no {@code ManagedBlocker}, so no compensation thread) rather than queueing on the lock.
++     *
++     * <p>Progress does not depend on becoming the pumper -- being pumped by another waiter is enough -- so the
++     * non-fair {@code tryLock} cannot starve a load. When the current pumper's own future completes it leaves;
++     * the next parked waiter becomes the pumper within one park interval. On the server thread (MCMT off, or a
++     * portal-transiting entity ticking inline) {@code tryLock} always wins and this degrades to the vanilla
++     * {@code managedBlock} loop, {@code throwIfFatalException} check included.
++     */
++    private void mcmtPumpUntil(BooleanSupplier done) {
++        while (!done.getAsBoolean()) {
++            MinecraftServer.throwIfFatalException();
++            boolean pumped = false;
++            if (this.mcmtChunkLoadLock.tryLock()) {
++                try {
++                    if (!done.getAsBoolean()) {
++                        pumped = this.mainThreadProcessor.pollTask();
++                    }
++                } finally {
++                    this.mcmtChunkLoadLock.unlock();
++                }
++            }
++
++            if (!pumped && !done.getAsBoolean()) {
++                Thread.yield();
++                java.util.concurrent.locks.LockSupport.parkNanos("mcmt chunk load", 100000L);
++            }
++        }
++    }
++
++    /**
++     * MCMT: take {@link #mcmtChunkLoadLock} without ever calling a blocking acquire from a pool worker.
++     *
++     * <p>{@code ManagedLock} / {@code lock.lock()} would grow the pool a compensation thread on every contended
++     * acquisition, and this lock is genuinely contended during a generation burst (many workers reach a cache
++     * miss while one pumps {@code runDistanceManagerUpdates}). Under that load the earlier {@code ManagedLock}
++     * version inflated the pool past 280 threads — worse than the residual it was meant to remove. So a worker
++     * that cannot get the lock parks 100 µs and retries, exactly as {@link #mcmtPumpUntil} does; the pool never
++     * grows. The caller must {@code unlock()} in a {@code finally}.
++     */
++    private void mcmtLockCooperatively() {
++        while (!this.mcmtChunkLoadLock.tryLock()) {
++            MinecraftServer.throwIfFatalException();
++            Thread.yield();
++            java.util.concurrent.locks.LockSupport.parkNanos("mcmt chunk load", 100000L);
++        }
++    }
++
+     @Nullable
+     private ChunkHolder getVisibleChunkIfPresent(long p_8365_) {
+         return this.chunkMap.getVisibleChunkIfPresent(p_8365_);
+@@ -121,44 +_,94 @@
+ 
+     private void storeInCache(long p_8367_, @Nullable ChunkAccess p_8368_, ChunkStatus p_331839_) {
+         for (int i = 3; i > 0; i--) {
+-            this.lastChunkPos[i] = this.lastChunkPos[i - 1];
+-            this.lastChunkStatus[i] = this.lastChunkStatus[i - 1];
+-            this.lastChunk[i] = this.lastChunk[i - 1];
++            this.lastChunks.set(i, this.lastChunks.get(i - 1));
+         }
+ 
+-        this.lastChunkPos[0] = p_8367_;
+-        this.lastChunkStatus[0] = p_331839_;
+-        this.lastChunk[0] = p_8368_;
++        this.lastChunks.set(0, new net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry(p_8367_, p_331839_, p_8368_));
+     }
+ 
+     @Nullable
+     @Override
+     public ChunkAccess getChunk(int p_8360_, int p_8361_, ChunkStatus p_330876_, boolean p_8363_) {
+-        if (Thread.currentThread() != this.mainThread) {
++        if (!this.mcmtCanDriveDirectly()) { // MCMT hook H5
+             return CompletableFuture.<ChunkAccess>supplyAsync(() -> this.getChunk(p_8360_, p_8361_, p_330876_, p_8363_), this.mainThreadProcessor).join();
+         } else {
+             ProfilerFiller profilerfiller = this.level.getProfiler();
+             profilerfiller.incrementCounter("getChunk");
+             long i = ChunkPos.asLong(p_8360_, p_8361_);
+ 
++            // MCMT hook: per-worker cache lookup, ahead of the shared cache. A FULL chunk cannot be unloaded
++            // or downgraded during a parallel tick phase -- only ServerChunkCache.tick()'s processUnloads
++            // does that, on the server thread between phases, and it always calls clearCache() afterwards --
++            // so a version-matched hit is safe to return without taking mcmtChunkLoadLock.
++            net.neoforged.neoforge.mcmt.parallel.ThreadChunkCache mcmtLocal = net.neoforged.neoforge.mcmt.MCMT.isPoolThread()
++                ? this.mcmtLocalChunkCache.get()
++                : null;
++            long mcmtVersion = mcmtLocal == null ? 0L : this.mcmtCacheVersion.get();
++            if (mcmtLocal != null) {
++                ChunkAccess mcmtHit = mcmtLocal.get(i, p_330876_, mcmtVersion);
++                if (mcmtHit != null) {
++                    return mcmtHit;
++                }
++            }
++
+             for (int j = 0; j < 4; j++) {
+-                if (i == this.lastChunkPos[j] && p_330876_ == this.lastChunkStatus[j]) {
+-                    ChunkAccess chunkaccess = this.lastChunk[j];
++                net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry entry = this.lastChunks.get(j);
++                if (entry != null && entry.matches(i, p_330876_)) {
++                    ChunkAccess chunkaccess = entry.chunk();
+                     if (chunkaccess != null || !p_8363_) {
+                         return chunkaccess;
+                     }
+                 }
+             }
+ 
++            ChunkHolder chunkholder = this.getVisibleChunkIfPresent(i);
++            if (chunkholder != null && chunkholder.currentlyLoading != null)
++                return chunkholder.currentlyLoading; // Neo: If the requested chunk is loading, bypass the future chain to prevent a deadlock.
++
+             profilerfiller.incrementCounter("getChunkCacheMiss");
+-            CompletableFuture<ChunkResult<ChunkAccess>> completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
+-            this.mainThreadProcessor.managedBlock(completablefuture::isDone);
++            // MCMT hook: one-pumper-many-waiters (MCMT-PLAN §4c / §4i). The lock still serialises every mutation
++            // of ChunkMap / DistanceManager -- but only for as long as it takes to create the load future, not
++            // for the whole wait on async chunk generation. Once the future exists the lock is dropped and the
++            // worker pumps the chunk-source executor cooperatively (mcmtPumpUntil): whichever waiter holds the
++            // lock at a given instant pumps one task, which advances *every* waiter's future, then releases so
++            // another can create its own load or take a turn pumping. The lock is only ever taken with tryLock
++            // (mcmtLockCooperatively) so a worker that has to wait parks rather than growing the pool a
++            // compensation thread -- before this rework a worker held the lock across the entire managedBlock
++            // wait, and the blocked acquisitions were the residual 145-189 compensation threads from §4b.
++            CompletableFuture<ChunkResult<ChunkAccess>> completablefuture;
++            this.mcmtLockCooperatively();
++            try {
++                // Another thread may have loaded it while we waited for the lock.
++                for (int j = 0; j < 4; j++) {
++                    net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry entry = this.lastChunks.get(j);
++                    if (entry != null && entry.matches(i, p_330876_)) {
++                        ChunkAccess cached = entry.chunk();
++                        if (cached != null || !p_8363_) {
++                            return cached;
++                        }
++                    }
++                }
++
++                completablefuture = this.getChunkFutureMainThread(p_8360_, p_8361_, p_330876_, p_8363_);
++            } finally {
++                this.mcmtChunkLoadLock.unlock();
++            }
++
++            this.mcmtPumpUntil(completablefuture::isDone);
+             ChunkResult<ChunkAccess> chunkresult = completablefuture.join();
+             ChunkAccess chunkaccess1 = chunkresult.orElse(null);
+             if (chunkaccess1 == null && p_8363_) {
+                 throw (IllegalStateException)Util.pauseInIde(new IllegalStateException("Chunk not there when requested: " + chunkresult.getError()));
+             } else {
++                // Racy but benign: lastChunks is an AtomicReferenceArray of immutable entries, so a concurrent
++                // storeInCache can only duplicate or drop a whole entry (a later cache miss, at worst), never
++                // publish a torn one. Not worth a lock hold on this hot path.
+                 this.storeInCache(i, chunkaccess1, p_330876_);
++                if (mcmtLocal != null) {
++                    mcmtLocal.put(i, p_330876_, chunkaccess1, mcmtVersion);
++                }
++
+                 return chunkaccess1;
+             }
+         }
+@@ -167,15 +_,16 @@
+     @Nullable
+     @Override
+     public LevelChunk getChunkNow(int p_8357_, int p_8358_) {
+-        if (Thread.currentThread() != this.mainThread) {
++        if (!this.mcmtCanDriveDirectly()) { // MCMT hook H5
+             return null;
+         } else {
+             this.level.getProfiler().incrementCounter("getChunkNow");
+             long i = ChunkPos.asLong(p_8357_, p_8358_);
+ 
+             for (int j = 0; j < 4; j++) {
+-                if (i == this.lastChunkPos[j] && this.lastChunkStatus[j] == ChunkStatus.FULL) {
+-                    ChunkAccess chunkaccess = this.lastChunk[j];
++                net.neoforged.neoforge.mcmt.parallel.ChunkCacheEntry entry = this.lastChunks.get(j);
++                if (entry != null && entry.matches(i, ChunkStatus.FULL)) {
++                    ChunkAccess chunkaccess = entry.chunk();
+                     return chunkaccess instanceof LevelChunk ? (LevelChunk)chunkaccess : null;
+                 }
+             }
+@@ -184,6 +_,7 @@
+             if (chunkholder == null) {
+                 return null;
+             } else {
++                if (chunkholder.currentlyLoading != null) return chunkholder.currentlyLoading; // Forge: If the requested chunk is loading, bypass the future chain to prevent a deadlock.
+                 ChunkAccess chunkaccess1 = chunkholder.getChunkIfPresent(ChunkStatus.FULL);
+                 if (chunkaccess1 != null) {
+                     this.storeInCache(i, chunkaccess1, ChunkStatus.FULL);
+@@ -198,17 +_,28 @@
+     }
+ 
+     private void clearCache() {
+-        Arrays.fill(this.lastChunkPos, ChunkPos.INVALID_CHUNK_POS);
+-        Arrays.fill(this.lastChunkStatus, null);
+-        Arrays.fill(this.lastChunk, null);
++        for (int i = 0; i < 4; i++) {
++            this.lastChunks.set(i, null);
++        }
++
++        this.mcmtCacheVersion.incrementAndGet(); // MCMT: drop every worker's per-thread chunk cache
+     }
+ 
+     public CompletableFuture<ChunkResult<ChunkAccess>> getChunkFuture(int p_8432_, int p_8433_, ChunkStatus p_330326_, boolean p_8435_) {
+-        boolean flag = Thread.currentThread() == this.mainThread;
++        boolean flag = this.mcmtCanDriveDirectly(); // MCMT hook H5
+         CompletableFuture<ChunkResult<ChunkAccess>> completablefuture;
+         if (flag) {
+-            completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
+-            this.mainThreadProcessor.managedBlock(completablefuture::isDone);
++            // MCMT hook: same cooperative-lock-then-pump discipline as getChunk (MCMT-PLAN §4c / §4i).
++            // getChunkFutureMainThread walks ChunkMap / DistanceManager, so it runs under the load lock; the wait
++            // afterwards does not. (This branch previously ran unlocked -- only the client debug overlay reaches
++            // it, so it never bit, but it was a latent hole.)
++            this.mcmtLockCooperatively();
++            try {
++                completablefuture = this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_);
++            } finally {
++                this.mcmtChunkLoadLock.unlock();
++            }
++            this.mcmtPumpUntil(completablefuture::isDone);
+         } else {
+             completablefuture = CompletableFuture.<CompletableFuture<ChunkResult<ChunkAccess>>>supplyAsync(
+                     () -> this.getChunkFutureMainThread(p_8432_, p_8433_, p_330326_, p_8435_), this.mainThreadProcessor
+@@ -352,22 +_,26 @@
+                 Util.shuffle(list, this.level.random);
+                 int k = this.level.getGameRules().getInt(GameRules.RULE_RANDOMTICKING);
+                 boolean flag = this.level.getLevelData().getGameTime() % 400L == 0L;
++                net.neoforged.neoforge.mcmt.TickBatch mcmtBatch = net.neoforged.neoforge.mcmt.MCMT.startChunkTicks(this.level); // MCMT hook H4
+ 
+                 for (ServerChunkCache.ChunkAndHolder serverchunkcache$chunkandholder : list) {
+                     LevelChunk levelchunk1 = serverchunkcache$chunkandholder.chunk;
+                     ChunkPos chunkpos = levelchunk1.getPos();
+-                    if (this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) {
++                    if ((this.level.isNaturalSpawningAllowed(chunkpos) && this.chunkMap.anyPlayerCloseEnoughForSpawning(chunkpos)) || this.distanceManager.shouldForceTicks(chunkpos.toLong())) {
+                         levelchunk1.incrementInhabitedTime(j);
+                         if (flag1 && (this.spawnEnemies || this.spawnFriendlies) && this.level.getWorldBorder().isWithinBounds(chunkpos)) {
+                             NaturalSpawner.spawnForChunk(this.level, levelchunk1, naturalspawner$spawnstate, this.spawnFriendlies, this.spawnEnemies, flag);
+                         }
+ 
+                         if (this.level.shouldTickBlocksAt(chunkpos.toLong())) {
+-                            this.level.tickChunk(levelchunk1, k);
++                            net.neoforged.neoforge.mcmt.MCMT.callTickChunk(mcmtBatch, this.level, levelchunk1, k); // MCMT hook H4
+                         }
+                     }
+                 }
+ 
++                // MCMT hook H4: the custom spawners below and the broadcast that follows both read block state
++                // this loop is still writing, so they wait for it.
++                net.neoforged.neoforge.mcmt.MCMT.finishChunkTicks(mcmtBatch);
+                 profilerfiller.popPush("customSpawners");
+                 if (flag1) {
+                     this.level.tickCustomSpawners(this.spawnEnemies, this.spawnFriendlies);
+@@ -435,11 +_,17 @@
+     }
+ 
+     public <T> void addRegionTicket(TicketType<T> p_8388_, ChunkPos p_8389_, int p_8390_, T p_8391_) {
+-        this.distanceManager.addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_);
++        addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_, false);
++    }
++    public <T> void addRegionTicket(TicketType<T> p_8388_, ChunkPos p_8389_, int p_8390_, T p_8391_, boolean forceTicks) {
++        this.distanceManager.addRegionTicket(p_8388_, p_8389_, p_8390_, p_8391_, forceTicks);
+     }
+ 
+     public <T> void removeRegionTicket(TicketType<T> p_8439_, ChunkPos p_8440_, int p_8441_, T p_8442_) {
+-        this.distanceManager.removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_);
++        removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_, false);
++    }
++    public <T> void removeRegionTicket(TicketType<T> p_8439_, ChunkPos p_8440_, int p_8441_, T p_8442_, boolean forceTicks) {
++        this.distanceManager.removeRegionTicket(p_8439_, p_8440_, p_8441_, p_8442_, forceTicks);
+     }
+ 
+     @Override

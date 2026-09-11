@@ -1,0 +1,178 @@
+--- a/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
++++ b/net/minecraft/world/level/entity/PersistentEntitySectionManager.java
+@@ -32,13 +_,43 @@
+ public class PersistentEntitySectionManager<T extends EntityAccess> implements AutoCloseable {
+     static final Logger LOGGER = LogUtils.getLogger();
+     final Set<UUID> knownUuids = Sets.newHashSet();
++
++    // MCMT hook H2: serialises structural changes to this level's entity storage.
++    //
++    // Adding, removing and re-sectioning an entity all walk the same non-concurrent structures — knownUuids, the
++    // EntitySectionStorage, the level's tick list, and ChunkMap's entity map. Vanilla never needed a lock because
++    // only the server thread ever got here. Under MCMT any ticking entity can spawn a child, die, or cross a
++    // section boundary, so several workers reach this at once and corrupt a fastutil map — which then throws
++    // somewhere else entirely, a tick or a minute later, with nothing in the stack to say why.
++    //
++    // Serialising this costs little: entities tick constantly but are created, destroyed and re-sectioned rarely,
++    // and the lock covers none of the ticking itself.
++    final Object mcmtStructuralLock = new Object();
+     final LevelCallback<T> callbacks;
+     private final EntityPersistentStorage<T> permanentStorage;
+     private final EntityLookup<T> visibleEntityStorage;
+     final EntitySectionStorage<T> sectionStorage;
+     private final LevelEntityGetter<T> entityGetter;
+-    private final Long2ObjectMap<Visibility> chunkVisibility = new Long2ObjectOpenHashMap<>();
+-    private final Long2ObjectMap<PersistentEntitySectionManager.ChunkLoadStatus> chunkLoadStatuses = new Long2ObjectOpenHashMap<>();
++    // MCMT hook H2: chunkVisibility and chunkLoadStatuses are plain open-addressed fastutil maps that vanilla
++    // only ever touched on the server thread. Under MCMT updateChunkStatus runs on whichever thread drains this
++    // chunk source's main-thread queue, and mcmtPumpUntil lets a pool worker drain that queue while it resolves a
++    // chunk load (MCMT-PLAN 4c/4i). A full-chunk-status promotion runnable queued there calls
++    // ChunkMap.onChunkStatusChange -> updateChunkStatus, so a worker can write both maps mid-tick. Other workers
++    // read them at the same time: every block-entity tick reaches chunkLoadStatuses.get through
++    // LevelChunk.isTicking -> ServerLevel.areEntitiesLoaded, and the natural-spawn pass reaches
++    // chunkVisibility.get through canPositionTick. A get that races a put's resize on an open-addressed map can
++    // return a wrong value or spin, and "never seen to crash" does not rule that out -- a wrong Visibility just
++    // makes an entity skip a tick.
++    //
++    // Wrap both maps in fastutil's synchronized view. Every get, put and remove becomes atomic under the view's
++    // own mutex, which is a leaf: the only code that runs while you hold it is the map's O(1) work, so it adds no
++    // ordering constraint against mcmtStructuralLock or the chunk-load lock and cannot deadlock. The check-then-act
++    // in ensureChunkQueuedForLoad stays non-atomic, but only the single holder of the chunk-load pump lock and the
++    // main-thread-only tick() and save phases ever run it, so no duplicate chunk-load request appears.
++    private final Long2ObjectMap<Visibility> chunkVisibility = Long2ObjectMaps.synchronize(new Long2ObjectOpenHashMap<>());
++    private final Long2ObjectMap<PersistentEntitySectionManager.ChunkLoadStatus> chunkLoadStatuses = Long2ObjectMaps.synchronize(
++        new Long2ObjectOpenHashMap<>()
++    );
+     private final LongSet chunksToUnload = new LongOpenHashSet();
+     private final Queue<ChunkEntities<T>> loadingInbox = Queues.newConcurrentLinkedQueue();
+ 
+@@ -71,7 +_,22 @@
+         return this.addEntity(p_157534_, false);
+     }
+ 
++    public boolean addNewEntityWithoutEvent(T entity) {
++        return this.addEntityWithoutEvent(entity, false);
++    }
++
+     private boolean addEntity(T p_157539_, boolean p_157540_) {
++        if (p_157539_ instanceof Entity entity && net.neoforged.neoforge.common.NeoForge.EVENT_BUS.post(new net.neoforged.neoforge.event.entity.EntityJoinLevelEvent(entity, entity.level(), p_157540_)).isCanceled()) return false;
++        return addEntityWithoutEvent(p_157539_, p_157540_);
++    }
++
++    private boolean addEntityWithoutEvent(T p_157539_, boolean p_157540_) {
++        synchronized (this.mcmtStructuralLock) { // MCMT hook H2
++            return this.addEntityWithoutEventLocked(p_157539_, p_157540_);
++        }
++    }
++
++    private boolean addEntityWithoutEventLocked(T p_157539_, boolean p_157540_) {
+         if (!this.addEntityUuid(p_157539_)) {
+             return false;
+         } else {
+@@ -101,11 +_,17 @@
+     }
+ 
+     public void addLegacyChunkEntities(Stream<T> p_157553_) {
+-        p_157553_.forEach(p_157607_ -> this.addEntity((T)p_157607_, true));
++        p_157553_.forEach(p_157607_ -> {
++            this.addEntity(p_157607_, true);
++            if (p_157607_ instanceof Entity entity) entity.onAddedToLevel();
++        });
+     }
+ 
+     public void addWorldGenChunkEntities(Stream<T> p_157560_) {
+-        p_157560_.forEach(p_157605_ -> this.addEntity((T)p_157605_, false));
++        p_157560_.forEach(p_157605_ -> {
++            this.addEntity(p_157605_, false);
++            if (p_157605_ instanceof Entity entity) entity.onAddedToLevel();
++        });
+     }
+ 
+     void startTicking(T p_157565_) {
+@@ -228,7 +_,10 @@
+     private void processPendingLoads() {
+         ChunkEntities<T> chunkentities;
+         while ((chunkentities = this.loadingInbox.poll()) != null) {
+-            chunkentities.getEntities().forEach(p_157593_ -> this.addEntity((T)p_157593_, true));
++            chunkentities.getEntities().forEach(p_157593_ -> {
++                this.addEntity(p_157593_, true);
++                if (p_157593_ instanceof Entity entity) entity.onAddedToLevel();
++            });
+             this.chunkLoadStatuses.put(chunkentities.getPos().toLong(), PersistentEntitySectionManager.ChunkLoadStatus.LOADED);
+         }
+     }
+@@ -241,9 +_,14 @@
+     private LongSet getAllChunksToSave() {
+         LongSet longset = this.sectionStorage.getAllChunksWithExistingSections();
+ 
+-        for (Entry<PersistentEntitySectionManager.ChunkLoadStatus> entry : Long2ObjectMaps.fastIterable(this.chunkLoadStatuses)) {
+-            if (entry.getValue() == PersistentEntitySectionManager.ChunkLoadStatus.LOADED) {
+-                longset.add(entry.getLongKey());
++        // MCMT hook H2: iterating the synchronized view is not atomic on its own, so hold the view's mutex for
++        // the whole walk. This runs only on the save and shutdown paths, when no worker writes the map, but the
++        // guard keeps the iteration correct if that ever changes.
++        synchronized (this.chunkLoadStatuses) {
++            for (Entry<PersistentEntitySectionManager.ChunkLoadStatus> entry : Long2ObjectMaps.fastIterable(this.chunkLoadStatuses)) {
++                if (entry.getValue() == PersistentEntitySectionManager.ChunkLoadStatus.LOADED) {
++                    longset.add(entry.getLongKey());
++                }
+             }
+         }
+ 
+@@ -367,11 +_,13 @@
+ 
+     class Callback implements EntityInLevelCallback {
+         private final T entity;
++        private final Entity realEntity;
+         private long currentSectionKey;
+         private EntitySection<T> currentSection;
+ 
+         Callback(T p_157614_, long p_157615_, EntitySection<T> p_157616_) {
+             this.entity = p_157614_;
++            this.realEntity = p_157614_ instanceof Entity ? (Entity) p_157614_ : null;
+             this.currentSectionKey = p_157615_;
+             this.currentSection = p_157616_;
+         }
+@@ -381,6 +_,17 @@
+             BlockPos blockpos = this.entity.blockPosition();
+             long i = SectionPos.asLong(blockpos);
+             if (i != this.currentSectionKey) {
++                // MCMT hook H2: crossing a section boundary re-sections the entity, which is a structural
++                // change like add and remove. Cheap to guard because the common case — the entity did not
++                // change section — never reaches here.
++                synchronized (PersistentEntitySectionManager.this.mcmtStructuralLock) {
++                    this.onSectionChangeLocked(blockpos, i);
++                }
++            }
++        }
++
++        private void onSectionChangeLocked(BlockPos blockpos, long i) {
++            {
+                 Visibility visibility = this.currentSection.getStatus();
+                 if (!this.currentSection.remove(this.entity)) {
+                     PersistentEntitySectionManager.LOGGER
+@@ -390,9 +_,11 @@
+                 PersistentEntitySectionManager.this.removeSectionIfEmpty(this.currentSectionKey, this.currentSection);
+                 EntitySection<T> entitysection = PersistentEntitySectionManager.this.sectionStorage.getOrCreateSection(i);
+                 entitysection.add(this.entity);
++                long oldSectionKey = currentSectionKey;
+                 this.currentSection = entitysection;
+                 this.currentSectionKey = i;
+                 this.updateStatus(visibility, entitysection.getStatus());
++                if (this.realEntity != null) net.neoforged.neoforge.common.CommonHooks.onEntityEnterSection(this.realEntity, oldSectionKey, i);
+             }
+         }
+ 
+@@ -428,6 +_,12 @@
+ 
+         @Override
+         public void onRemove(Entity.RemovalReason p_157619_) {
++            synchronized (PersistentEntitySectionManager.this.mcmtStructuralLock) { // MCMT hook H2
++                this.onRemoveLocked(p_157619_);
++            }
++        }
++
++        private void onRemoveLocked(Entity.RemovalReason p_157619_) {
+             if (!this.currentSection.remove(this.entity)) {
+                 PersistentEntitySectionManager.LOGGER
+                     .warn("Entity {} wasn't found in section {} (destroying due to {})", this.entity, SectionPos.of(this.currentSectionKey), p_157619_);
