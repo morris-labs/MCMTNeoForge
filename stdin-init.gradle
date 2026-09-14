@@ -1,0 +1,8 @@
+// Connects the Gradle client's stdin to the game's console, so `runServer` can be driven
+// non-interactively (feed it commands, then `stop`, and get a clean shutdown to inspect).
+// ModDevGradle's RunGameTask extends JavaExec but leaves standardInput as the default empty stream.
+gradle.allprojects { project ->
+    project.tasks.withType(JavaExec).configureEach { task ->
+        task.standardInput = System.in
+    }
+}

@@ -48,6 +48,7 @@ import net.neoforged.neoforge.mcmt.MCMT;
 import net.neoforged.neoforge.mcmt.config.MCMTConfig;
 import net.neoforged.neoforge.mcmt.parallel.MCMTThreadPool;
 import net.neoforged.neoforge.mcmt.serdes.SerDesRegistry;
+import net.neoforged.neoforge.network.registration.NetworkRegistry;
 import org.jetbrains.annotations.ApiStatus;
 
 /**
@@ -360,7 +361,10 @@ public final class MCMTCommand {
      */
     private static int spawnTestPlayers(CommandContext<CommandSourceStack> ctx, int count) {
         CommandSourceStack source = ctx.getSource();
-        net.minecraft.server.level.ServerLevel level = source.getLevel();
+        // The dedicated server's console command source has no bound level (unlike a player or a
+        // command block), so source.getLevel() returns null when this runs from stdin/RCON. Fall back
+        // to the overworld, the same default the console uses for level-scoped vanilla commands.
+        net.minecraft.server.level.ServerLevel level = source.getLevel() != null ? source.getLevel() : source.getServer().overworld();
         net.minecraft.world.phys.Vec3 at = source.getPosition();
 
         int spawned = 0;
@@ -384,6 +388,13 @@ public final class MCMTCommand {
 
             Connection connection = new Connection(PacketFlow.SERVERBOUND);
             EmbeddedChannel channel = new EmbeddedChannel(connection);
+            // Without this, the connection never goes through the real login/configuration handshake, so
+            // NetworkRegistry.hasChannel sees no negotiated channels for it. Any mod that sends a custom
+            // payload on player join (KubeJS's datapack sync, among others) then hits
+            // NetworkRegistry.checkPacket's "may not be sent to the client" throw before placeNewPlayer
+            // finishes, and the test player never gets registered. configureMockConnection marks the
+            // connection as having negotiated every registered channel, the same treatment game tests use.
+            NetworkRegistry.configureMockConnection(connection);
             channel.pipeline().addFirst("mcmt-discard-outbound", new ChannelOutboundHandlerAdapter() {
                 @Override
                 public void write(ChannelHandlerContext handlerCtx, Object msg, ChannelPromise promise) {
