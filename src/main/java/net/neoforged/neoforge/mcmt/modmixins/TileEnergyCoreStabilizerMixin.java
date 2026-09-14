@@ -18,6 +18,7 @@ import com.brandon3055.draconicevolution.init.DEContent;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction.Axis;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -34,15 +35,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 // an exception mid-loop poisons that one MCMT worker's flag permanently. Fix: reimplement
 // buildMultiBlock(Axis) in full (decompiled from the deployed jar) so the loop and the two trailing writes
 // are wrapped in a genuine try/finally, then cancel the original.
+//
+// level and worldPosition are declared two levels up, on vanilla BlockEntity, not on
+// TileEnergyCoreStabilizer or TileBCore -- @Shadow only resolves members declared directly on the mixin's
+// target class, so shadowing them as fields threw InvalidMixinException at weave time (caught by a live
+// boot smoke test, not by compileJava; see TileEnergyPylonMixin, which hit the identical failure).
+// BlockEntity's own public getLevel()/getBlockPos() sidestep it without needing @Shadow at all.
 @Mixin(TileEnergyCoreStabilizer.class)
 abstract class TileEnergyCoreStabilizerMixin {
-    @Shadow
-    protected Level level;
-
-    @Shadow
-    @Final
-    protected BlockPos worldPosition;
-
     @Shadow
     @Final
     public ManagedPos coreOffset;
@@ -57,6 +57,9 @@ abstract class TileEnergyCoreStabilizerMixin {
 
     @Inject(method = "buildMultiBlock(Lnet/minecraft/core/Direction$Axis;)V", at = @At("HEAD"), cancellable = true)
     private void mcmt$buildMultiBlockAtomic(Axis axis, CallbackInfo ci) {
+        BlockEntity self = (BlockEntity) (Object) this;
+        Level level = self.getLevel();
+        BlockPos worldPosition = self.getBlockPos();
         coreOffset.set(null);
         DraconicEvolutionThreadLocals.BUILDING_LOCK.set(true);
         try {

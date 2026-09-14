@@ -19,6 +19,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.neoforged.neoforge.common.Tags.Blocks;
 import org.spongepowered.asm.mixin.Final;
@@ -38,15 +39,21 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 // ThreadLocal, an exception between the writes poisons that one MCMT worker's flag permanently. Fix:
 // reimplement validateStructure() in full (decompiled from the deployed jar) so the two placement calls are
 // wrapped in a genuine try/finally, then cancel the original.
+//
+// The original method also calls debug(...) three times -- a logging-only call inherited from the
+// superclass TileBCore (BrandonsCore), not declared on TileEnergyPylon itself. @Shadow only resolves
+// members declared directly on the mixin's target class, so shadowing it here threw InvalidMixinException
+// at weave time (caught by a live boot smoke test, not by compileJava). Dropped rather than routed through
+// another mixin: it's pure diagnostic logging with no effect on game state or on this fix's correctness.
+//
+// level and worldPosition hit the same InvalidMixinException, for the same reason: they're declared two
+// levels up, on vanilla BlockEntity, not on TileEnergyPylon or TileBCore. This turned out to be systemic,
+// not specific to this class -- TileStructureBlockMixin and TileEnergyCoreStabilizerMixin shadowed them as
+// plain fields the same way and hit the identical failure once the boot smoke test's mixin-weaving order
+// actually reached them (fixed the same way there too). BlockEntity's own public getLevel()/getBlockPos()
+// sidestep it entirely without needing @Shadow at all.
 @Mixin(TileEnergyPylon.class)
 abstract class TileEnergyPylonMixin {
-    @Shadow
-    protected Level level;
-
-    @Shadow
-    @Final
-    protected BlockPos worldPosition;
-
     @Shadow
     @Final
     public ManagedBool structureValid;
@@ -62,11 +69,6 @@ abstract class TileEnergyPylonMixin {
     @Shadow
     @Final
     public ManagedEnum<EnumColour> colour;
-
-    @Shadow
-    public void debug(Object message) {
-        throw new UnsupportedOperationException();
-    }
 
     @Shadow
     public boolean isStructureValid() {
@@ -85,7 +87,9 @@ abstract class TileEnergyPylonMixin {
 
     @Inject(method = "validateStructure()Z", at = @At("HEAD"), cancellable = true)
     private void mcmt$validateStructureAtomic(CallbackInfoReturnable<Boolean> cir) {
-        debug("ValidateStructure, IsValid: " + structureValid.get());
+        BlockEntity self = (BlockEntity) (Object) this;
+        Level level = self.getLevel();
+        BlockPos worldPosition = self.getBlockPos();
         if (!structureValid.get()) {
             boolean found = false;
 
@@ -111,7 +115,6 @@ abstract class TileEnergyPylonMixin {
                 }
             }
 
-            debug("Glass block found: " + found);
             if (!found) {
                 level.setBlockAndUpdate(worldPosition, level.getBlockState(worldPosition).setValue(EnergyPylon.FACING, Direction.UP));
                 colour.set(null);
@@ -119,7 +122,6 @@ abstract class TileEnergyPylonMixin {
         }
 
         structureValid.set(isStructureValid());
-        debug("Validate Result: " + structureValid.get());
         if (structureValid.get() && coreOffset.isNull()) {
             selectNextCore();
         } else if (!structureValid.get() && coreOffset.notNull()) {

@@ -11,6 +11,7 @@ import com.brandon3055.draconicevolution.init.DEContent;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -26,21 +27,23 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 // unrelated caller on any thread; with a per-thread ThreadLocal, an exception between the writes poisons
 // that one MCMT worker's flag permanently. Fix: reimplement revert() in full (decompiled from the deployed
 // jar) so the two calls are wrapped in a genuine try/finally, then cancel the original.
+//
+// level and worldPosition are declared two levels up, on vanilla BlockEntity, not on TileStructureBlock
+// or TileBCore -- @Shadow only resolves members declared directly on the mixin's target class, so
+// shadowing them as fields throws InvalidMixinException at weave time (caught by a live boot smoke test,
+// not by compileJava; see TileEnergyPylonMixin, which hit the identical failure first). BlockEntity's own
+// public getLevel()/getBlockPos() sidestep it without needing @Shadow at all.
 @Mixin(TileStructureBlock.class)
 abstract class TileStructureBlockMixin {
-    @Shadow
-    protected Level level;
-
-    @Shadow
-    @Final
-    protected BlockPos worldPosition;
-
     @Shadow
     @Final
     public ManagedBool reverting;
 
     @Inject(method = "revert()V", at = @At("HEAD"), cancellable = true)
     private void mcmt$revertAtomic(CallbackInfo ci) {
+        BlockEntity self = (BlockEntity) (Object) this;
+        Level level = self.getLevel();
+        BlockPos worldPosition = self.getBlockPos();
         if (!level.isClientSide) {
             DraconicEvolutionThreadLocals.BUILDING_LOCK.set(true);
             try {
