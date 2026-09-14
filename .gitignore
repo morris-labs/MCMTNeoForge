@@ -20,6 +20,9 @@ tests/.eclipse
 /*/build
 /*/.gradle
 
+#extracted third-party jars needed only at compileOnly time for mcmt/modmixins
+/.libs
+
 #occupational hazards
 /projects/**/*.launch
 /repo/

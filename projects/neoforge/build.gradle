@@ -1,6 +1,8 @@
 import net.neoforged.jarcompatibilitychecker.gradle.JCCPlugin
 import net.neoforged.jarcompatibilitychecker.gradle.CompatibilityTask
 import net.neoforged.jarcompatibilitychecker.gradle.ProvideNeoForgeJarTask
+import org.gradle.api.tasks.Copy
+import org.gradle.api.tasks.Sync
 
 plugins {
     id 'java-library'
@@ -113,6 +115,11 @@ dependencies {
     libraries "net.jodah:typetools:${project.typetools_version}"
     libraries "net.minecrell:terminalconsoleappender:${project.terminalconsoleappender_version}"
     libraries("net.fabricmc:sponge-mixin:${project.mixin_version}") { transitive = false }
+    // Dev-run-only: production installs get this from mods that jar-in-jar it, and the
+    // dev sandbox's mod-jar extraction runs too late for FML's early MixinExtras module-read
+    // check. Not part of the production libraries/ layout (verified against a real ATM10
+    // server install); safe to add here since neoDev runs never ship this config.
+    libraries "io.github.llamalad7:mixinextras-neoforge:${project.mixin_extras_version}"
     libraries "org.openjdk.nashorn:nashorn-core:${project.nashorn_core_version}"
     libraries ("net.neoforged:JarJarSelector:${project.jarjar_version}") {
         exclude group: 'org.slf4j'
@@ -125,6 +132,24 @@ dependencies {
 
     compileOnly "org.jetbrains:annotations:${project.jetbrains_annotations_version}"
 
+    // Real ATM10 mod jars, so mcmt/modmixins classes can @Shadow their fields and methods.
+    compileOnly files(
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/oritech-neoforge-1.21.1-1.2.10.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/ftb-chunks-neoforge-2101.1.21.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/ftb-library-neoforge-2101.1.35.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/EnderStorage-1.21.1-2.13.0.191.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/DimStorage-1.21.1-9.1.1.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/Draconic-Evolution-1.21.1-3.1.4.632.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/integrateddynamics-1.21.1-neoforge-1.34.0.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/cyclopscore-1.21.1-neoforge-1.29.2.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/BrandonsCore-1.21.1-3.2.1.309.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/CodeChickenLib-1.21.1-4.6.1.529.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/waystones-neoforge-1.21.1-21.1.40.jar",
+        "${rootProject.projectDir}/../reference/ATM10Serv/mods/compactmachines-neoforge-7.0.81.jar",
+        "${rootProject.projectDir}/.libs/feather-0.1.8.jar",
+        "${rootProject.projectDir}/.libs/compactmachines-core-api-7.0.81.jar",
+    )
+
     userdevCompileOnly jarJar("io.github.llamalad7:mixinextras-neoforge:${project.mixin_extras_version}")
 
     userdevTestFixtures("net.neoforged.fancymodloader:junit-fml:${project.fancy_mod_loader_version}") {
@@ -135,6 +160,28 @@ dependencies {
     // (Only needed when compiling through IntelliJ non-delegated builds - otherwise `compileOnly` would work).
     implementation(jarJar(project(":neoforge-coremods")))
 }
+
+// The two `compileOnly files(...)` entries above for `feather-0.1.8.jar` and
+// `compactmachines-core-api-7.0.81.jar` need a `.libs/` directory that a clean checkout
+// doesn't have. Both jars are bundled (JarJar) inside the real CompactMachines mod jar, so
+// extract them from there instead of committing binaries or relying on a manual copy.
+tasks.register("extractCompactMachinesLibs", Copy) {
+    def cmJar = file("${rootProject.projectDir}/../reference/ATM10Serv/mods/compactmachines-neoforge-7.0.81.jar")
+    from(zipTree(cmJar)) {
+        include "META-INF/jarjar/feather-0.1.8.jar"
+        include "META-INF/jarjar/dev.compactmods.compactmachines.core-api-7.0.81.jar"
+    }
+    // Flatten out of META-INF/jarjar/ and rename the core-api jar to match the
+    // `compileOnly files(...)` reference above.
+    eachFile { fcd ->
+        fcd.path = fcd.name == "dev.compactmods.compactmachines.core-api-7.0.81.jar"
+                ? "compactmachines-core-api-7.0.81.jar"
+                : fcd.name
+    }
+    includeEmptyDirs = false
+    into "${rootProject.projectDir}/.libs"
+}
+compileJava.dependsOn("extractCompactMachinesLibs")
 
 neoDev {
     runs {
@@ -150,6 +197,10 @@ neoDev {
             server()
     }
 
+    atm10smoke {
+            server()
+    }
+
     gameTestServer {
             type = "gameTestServer"
     }
@@ -160,6 +211,27 @@ neoDev {
                     '--output', rootProject.file("src/generated/resources").absolutePath
 }
     }
+}
+
+// `run/atm10smoke/mods` (relative to this project directory, i.e.
+// projects/neoforge/run/atm10smoke/mods) is gitignored and otherwise empty on a clean
+// checkout, so the atm10smoke run would boot with zero ATM10 mods loaded and never
+// exercise the mcmt/modmixins classes' targets. Sync keeps it in step with the reference
+// install and drops any jar that was removed or renamed there.
+tasks.register("syncAtm10SmokeMods", Sync) {
+    from("${rootProject.projectDir}/../reference/ATM10Serv/mods")
+    include "*.jar"
+    into "run/atm10smoke/mods"
+}
+
+// ModDevGradle names the run task "run" + capitalize(run name). The `neoDev { runs { ... } }`
+// block above already registered "atm10smoke" as a RunModel by the time this line runs, and
+// ModDevRunWorkflow.setupRuns wires a DomainObjectCollection#all(...) listener (not
+// afterEvaluate) at plugin-apply time that eagerly calls tasks.register("runAtm10smoke", ...)
+// the moment that RunModel is added to the container — so the task is already registered here,
+// confirmed by reading ModDevRunWorkflow's bytecode (moddev-gradle 2.0.115) rather than guessed.
+tasks.named("runAtm10smoke") {
+    dependsOn("syncAtm10SmokeMods")
 }
 
 tasks.withType(JavaCompile.class).configureEach {

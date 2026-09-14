@@ -1,0 +1,31 @@
+{
+  "required": true,
+  "package": "net.neoforged.neoforge.mcmt.modmixins",
+  "mixins": [
+    "AugmentApplicationBlockMixin",
+    "ClaimedChunkManagerImplMixin",
+    "EnderStorageManagerMixin",
+    "DimStorageManagerMixin",
+    "BlockCableMixin",
+    "NetworkGenerationHelperMixin",
+    "CableHelpersMixin",
+    "StructureBlockMixin",
+    "TileStructureBlockMixin",
+    "TileEnergyCoreStabilizerMixin",
+    "TileEnergyPylonMixin",
+    "EnergyPylonMixin",
+    "WaystoneIndexManagerMixin",
+    "WarpPortalManagerMixin",
+    "CMKeyedDataFileManagerMixin",
+    "CMRoomRegistrarMixin",
+    "RoomRegistrarDataMixin",
+    "GraphChunkManagerMixin",
+    "RoomRegistrarDataAccessor",
+    "CMSingletonDataFileManagerMixin"
+  ],
+  "client": [],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "minVersion": "0.8"
+}
