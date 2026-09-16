@@ -1,0 +1,166 @@
+--- a/net/minecraft/world/ticks/LevelChunkTicks.java
++++ b/net/minecraft/world/ticks/LevelChunkTicks.java
+@@ -25,6 +_,19 @@
+     private final Set<ScheduledTick<?>> ticksPerPosition = new ObjectOpenCustomHashSet<>(ScheduledTick.UNIQUE_TICK_HASH);
+     @Nullable
+     private BiConsumer<LevelChunkTicks<T>, ScheduledTick<T>> onTickAdded;
++    // MCMT: this chunk's tickQueue/ticksPerPosition were plain, unsynchronized collections. Under
++    // vanilla, one thread drains this container (LevelTicks.tick(), via poll()) and schedules into it
++    // (Level.scheduleTick(), via schedule()) strictly in sequence -- both happen on the single server
++    // thread. H1 dispatches each level's own tick (including its LevelTicks drain) to a pool worker,
++    // while H2/H3 dispatch that same level's entity and block-entity ticks to other pool workers running
++    // concurrently -- and any of those can call scheduleTick on a block in this chunk while this chunk's
++    // own container is mid-drain on a different thread. That raced ticksPerPosition (an
++    // ObjectOpenCustomHashSet), corrupting its internal table and throwing an
++    // ArrayIndexOutOfBoundsException out of a concurrent rehash. Every accessor is synchronized on this
++    // lock, not just schedule()/poll(), because ChunkMap also reads a chunk's container directly
++    // (count(), for chunk-status reporting) without going through the owning LevelTicks at all --
++    // LevelTicks's own lock (see LevelTicks.mcmtLock) cannot protect that path.
++    private final Object mcmtLock = new Object();
+ 
+     public LevelChunkTicks() {
+     }
+@@ -38,28 +_,36 @@
+     }
+ 
+     public void setOnTickAdded(@Nullable BiConsumer<LevelChunkTicks<T>, ScheduledTick<T>> p_193182_) {
+-        this.onTickAdded = p_193182_;
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            this.onTickAdded = p_193182_;
++        }
+     }
+ 
+     @Nullable
+     public ScheduledTick<T> peek() {
+-        return this.tickQueue.peek();
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            return this.tickQueue.peek();
++        }
+     }
+ 
+     @Nullable
+     public ScheduledTick<T> poll() {
+-        ScheduledTick<T> scheduledtick = this.tickQueue.poll();
+-        if (scheduledtick != null) {
+-            this.ticksPerPosition.remove(scheduledtick);
+-        }
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            ScheduledTick<T> scheduledtick = this.tickQueue.poll();
++            if (scheduledtick != null) {
++                this.ticksPerPosition.remove(scheduledtick);
++            }
+ 
+-        return scheduledtick;
++            return scheduledtick;
++        }
+     }
+ 
+     @Override
+     public void schedule(ScheduledTick<T> p_193177_) {
+-        if (this.ticksPerPosition.add(p_193177_)) {
+-            this.scheduleUnchecked(p_193177_);
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            if (this.ticksPerPosition.add(p_193177_)) {
++                this.scheduleUnchecked(p_193177_);
++            }
+         }
+     }
+ 
+@@ -72,55 +_,70 @@
+ 
+     @Override
+     public boolean hasScheduledTick(BlockPos p_193179_, T p_193180_) {
+-        return this.ticksPerPosition.contains(ScheduledTick.probe(p_193180_, p_193179_));
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            return this.ticksPerPosition.contains(ScheduledTick.probe(p_193180_, p_193179_));
++        }
+     }
+ 
+     public void removeIf(Predicate<ScheduledTick<T>> p_193184_) {
+-        Iterator<ScheduledTick<T>> iterator = this.tickQueue.iterator();
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            Iterator<ScheduledTick<T>> iterator = this.tickQueue.iterator();
+ 
+-        while (iterator.hasNext()) {
+-            ScheduledTick<T> scheduledtick = iterator.next();
+-            if (p_193184_.test(scheduledtick)) {
+-                iterator.remove();
+-                this.ticksPerPosition.remove(scheduledtick);
++            while (iterator.hasNext()) {
++                ScheduledTick<T> scheduledtick = iterator.next();
++                if (p_193184_.test(scheduledtick)) {
++                    iterator.remove();
++                    this.ticksPerPosition.remove(scheduledtick);
++                }
+             }
+         }
+     }
+ 
+     public Stream<ScheduledTick<T>> getAll() {
+-        return this.tickQueue.stream();
++        // MCMT: snapshot into a List while holding the lock instead of returning tickQueue.stream()
++        // directly -- a Stream backed by the live queue would iterate it lazily, after this method (and
++        // its lock) has already returned, racing whatever else mutates the queue in the meantime.
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            return List.copyOf(this.tickQueue).stream();
++        }
+     }
+ 
+     @Override
+     public int count() {
+-        return this.tickQueue.size() + (this.pendingTicks != null ? this.pendingTicks.size() : 0);
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            return this.tickQueue.size() + (this.pendingTicks != null ? this.pendingTicks.size() : 0);
++        }
+     }
+ 
+     public ListTag save(long p_193174_, Function<T, String> p_193175_) {
+-        ListTag listtag = new ListTag();
+-        if (this.pendingTicks != null) {
+-            for (SavedTick<T> savedtick : this.pendingTicks) {
+-                listtag.add(savedtick.save(p_193175_));
+-            }
+-        }
+-
+-        for (ScheduledTick<T> scheduledtick : this.tickQueue) {
+-            listtag.add(SavedTick.saveTick(scheduledtick, p_193175_, p_193174_));
+-        }
+-
+-        return listtag;
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            ListTag listtag = new ListTag();
++            if (this.pendingTicks != null) {
++                for (SavedTick<T> savedtick : this.pendingTicks) {
++                    listtag.add(savedtick.save(p_193175_));
++                }
++            }
++
++            for (ScheduledTick<T> scheduledtick : this.tickQueue) {
++                listtag.add(SavedTick.saveTick(scheduledtick, p_193175_, p_193174_));
++            }
++
++            return listtag;
++        }
+     }
+ 
+     public void unpack(long p_193172_) {
+-        if (this.pendingTicks != null) {
+-            int i = -this.pendingTicks.size();
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            if (this.pendingTicks != null) {
++                int i = -this.pendingTicks.size();
+ 
+-            for (SavedTick<T> savedtick : this.pendingTicks) {
+-                this.scheduleUnchecked(savedtick.unpack(p_193172_, (long)(i++)));
++                for (SavedTick<T> savedtick : this.pendingTicks) {
++                    this.scheduleUnchecked(savedtick.unpack(p_193172_, (long)(i++)));
++                }
+             }
++
++            this.pendingTicks = null;
+         }
+-
+-        this.pendingTicks = null;
+     }
+ 
+     public static <T> LevelChunkTicks<T> load(ListTag p_193186_, Function<String, Optional<T>> p_193187_, ChunkPos p_193188_) {

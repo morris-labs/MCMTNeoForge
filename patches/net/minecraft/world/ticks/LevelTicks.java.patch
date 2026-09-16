@@ -1,0 +1,261 @@
+--- a/net/minecraft/world/ticks/LevelTicks.java
++++ b/net/minecraft/world/ticks/LevelTicks.java
+@@ -44,36 +_,83 @@
+             this.updateContainerScheduling(p_193250_);
+         }
+     };
++    // MCMT: allContainers/nextTickForContainer/toRunThisTick/toRunThisTickSet/alreadyRunThisTick are all
++    // plain, unsynchronized collections. Under vanilla, tick() (draining this level's scheduled block/
++    // fluid ticks) and every mutator below (addContainer/removeContainer on chunk load/unload, schedule()
++    // from Level.scheduleTick, willTickThisTick() from block logic like RedstoneTorchBlock) run strictly
++    // in sequence on the single server thread. H1 dispatches this level's own tick() to a pool worker
++    // while H2/H3 dispatch that same level's entity and block-entity ticks -- which can call scheduleTick
++    // or willTickThisTick -- to other pool workers concurrently, and chunk load/unload can also run
++    // concurrently with either. See LevelChunkTicks.mcmtLock for the sibling per-chunk lock this
++    // complements: that one protects a single chunk's own tickQueue/ticksPerPosition (including direct
++    // access that bypasses this class entirely, e.g. ChunkMap's chunk-status reporting); this one
++    // protects the level-wide bookkeeping (which chunks exist, which is due next, what's collected for
++    // this tick) that only this class touches.
++    private final Object mcmtLock = new Object();
++    // MCMT: total order for the two-instance lock in copyAreaFrom (see mcmtOrderedLock below).
++    // System.identityHashCode isn't guaranteed unique, so a real per-instance counter is used instead of
++    // hashing mcmtLock -- a hash collision between two different levels' LevelTicks would otherwise let
++    // two concurrent clone commands lock the same pair of levels in opposite orders and deadlock.
++    private static final java.util.concurrent.atomic.AtomicLong MCMT_LOCK_ORDER = new java.util.concurrent.atomic.AtomicLong();
++    private final long mcmtLockOrder = MCMT_LOCK_ORDER.getAndIncrement();
+ 
+     public LevelTicks(LongPredicate p_193211_, Supplier<ProfilerFiller> p_193212_) {
+         this.tickCheck = p_193211_;
+         this.profiler = p_193212_;
+     }
+ 
++    // MCMT: acquires two different LevelTicks instances' locks (used only by copyAreaFrom, which can
++    // target two different levels) in a fixed global order by mcmtLockOrder, so no two threads can ever
++    // acquire the same pair of locks in opposite order.
++    private static void mcmtOrderedLock(LevelTicks<?> p_first, LevelTicks<?> p_second, Runnable p_action) {
++        if (p_first == p_second) {
++            synchronized (p_first.mcmtLock) {
++                p_action.run();
++            }
++            return;
++        }
++
++        LevelTicks<?> lower = p_first.mcmtLockOrder < p_second.mcmtLockOrder ? p_first : p_second;
++        LevelTicks<?> higher = lower == p_first ? p_second : p_first;
++        synchronized (lower.mcmtLock) {
++            synchronized (higher.mcmtLock) {
++                p_action.run();
++            }
++        }
++    }
++
+     public void addContainer(ChunkPos p_193232_, LevelChunkTicks<T> p_193233_) {
+-        long i = p_193232_.toLong();
+-        this.allContainers.put(i, p_193233_);
+-        ScheduledTick<T> scheduledtick = p_193233_.peek();
+-        if (scheduledtick != null) {
+-            this.nextTickForContainer.put(i, scheduledtick.triggerTick());
+-        }
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            long i = p_193232_.toLong();
++            this.allContainers.put(i, p_193233_);
++            ScheduledTick<T> scheduledtick = p_193233_.peek();
++            if (scheduledtick != null) {
++                this.nextTickForContainer.put(i, scheduledtick.triggerTick());
++            }
+ 
+-        p_193233_.setOnTickAdded(this.chunkScheduleUpdater);
++            p_193233_.setOnTickAdded(this.chunkScheduleUpdater);
++        }
+     }
+ 
+     public void removeContainer(ChunkPos p_193230_) {
+-        long i = p_193230_.toLong();
+-        LevelChunkTicks<T> levelchunkticks = this.allContainers.remove(i);
+-        this.nextTickForContainer.remove(i);
+-        if (levelchunkticks != null) {
+-            levelchunkticks.setOnTickAdded(null);
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            long i = p_193230_.toLong();
++            LevelChunkTicks<T> levelchunkticks = this.allContainers.remove(i);
++            this.nextTickForContainer.remove(i);
++            if (levelchunkticks != null) {
++                levelchunkticks.setOnTickAdded(null);
++            }
+         }
+     }
+ 
+     @Override
+     public void schedule(ScheduledTick<T> p_193252_) {
+-        long i = ChunkPos.asLong(p_193252_.pos());
+-        LevelChunkTicks<T> levelchunkticks = this.allContainers.get(i);
++        LevelChunkTicks<T> levelchunkticks;
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            long i = ChunkPos.asLong(p_193252_.pos());
++            levelchunkticks = this.allContainers.get(i);
++        }
++
+         if (levelchunkticks == null) {
+             Util.pauseInIde(new IllegalStateException("Trying to schedule tick in not loaded position " + p_193252_.pos()));
+         } else {
+@@ -82,15 +_,17 @@
+     }
+ 
+     public void tick(long p_193226_, int p_193227_, BiConsumer<BlockPos, T> p_193228_) {
+-        ProfilerFiller profilerfiller = this.profiler.get();
+-        profilerfiller.push("collect");
+-        this.collectTicks(p_193226_, p_193227_, profilerfiller);
+-        profilerfiller.popPush("run");
+-        profilerfiller.incrementCounter("ticksToRun", this.toRunThisTick.size());
+-        this.runCollectedTicks(p_193228_);
+-        profilerfiller.popPush("cleanup");
+-        this.cleanupAfterTick();
+-        profilerfiller.pop();
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            ProfilerFiller profilerfiller = this.profiler.get();
++            profilerfiller.push("collect");
++            this.collectTicks(p_193226_, p_193227_, profilerfiller);
++            profilerfiller.popPush("run");
++            profilerfiller.incrementCounter("ticksToRun", this.toRunThisTick.size());
++            this.runCollectedTicks(p_193228_);
++            profilerfiller.popPush("cleanup");
++            this.cleanupAfterTick();
++            profilerfiller.pop();
++        }
+     }
+ 
+     private void collectTicks(long p_193222_, int p_193223_, ProfilerFiller p_193224_) {
+@@ -201,14 +_,20 @@
+ 
+     @Override
+     public boolean hasScheduledTick(BlockPos p_193254_, T p_193255_) {
+-        LevelChunkTicks<T> levelchunkticks = this.allContainers.get(ChunkPos.asLong(p_193254_));
++        LevelChunkTicks<T> levelchunkticks;
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            levelchunkticks = this.allContainers.get(ChunkPos.asLong(p_193254_));
++        }
++
+         return levelchunkticks != null && levelchunkticks.hasScheduledTick(p_193254_, p_193255_);
+     }
+ 
+     @Override
+     public boolean willTickThisTick(BlockPos p_193282_, T p_193283_) {
+-        this.calculateTickSetIfNeeded();
+-        return this.toRunThisTickSet.contains(ScheduledTick.probe(p_193283_, p_193282_));
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            this.calculateTickSetIfNeeded();
++            return this.toRunThisTickSet.contains(ScheduledTick.probe(p_193283_, p_193282_));
++        }
+     }
+ 
+     private void calculateTickSetIfNeeded() {
+@@ -235,21 +_,23 @@
+     }
+ 
+     public void clearArea(BoundingBox p_193235_) {
+-        Predicate<ScheduledTick<T>> predicate = p_193241_ -> p_193235_.isInside(p_193241_.pos());
+-        this.forContainersInArea(p_193235_, (p_193276_, p_193277_) -> {
+-            ScheduledTick<T> scheduledtick = p_193277_.peek();
+-            p_193277_.removeIf(predicate);
+-            ScheduledTick<T> scheduledtick1 = p_193277_.peek();
+-            if (scheduledtick1 != scheduledtick) {
+-                if (scheduledtick1 != null) {
+-                    this.updateContainerScheduling(scheduledtick1);
+-                } else {
+-                    this.nextTickForContainer.remove(p_193276_);
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            Predicate<ScheduledTick<T>> predicate = p_193241_ -> p_193235_.isInside(p_193241_.pos());
++            this.forContainersInArea(p_193235_, (p_193276_, p_193277_) -> {
++                ScheduledTick<T> scheduledtick = p_193277_.peek();
++                p_193277_.removeIf(predicate);
++                ScheduledTick<T> scheduledtick1 = p_193277_.peek();
++                if (scheduledtick1 != scheduledtick) {
++                    if (scheduledtick1 != null) {
++                        this.updateContainerScheduling(scheduledtick1);
++                    } else {
++                        this.nextTickForContainer.remove(p_193276_);
++                    }
+                 }
+-            }
+-        });
+-        this.alreadyRunThisTick.removeIf(predicate);
+-        this.toRunThisTick.removeIf(predicate);
++            });
++            this.alreadyRunThisTick.removeIf(predicate);
++            this.toRunThisTick.removeIf(predicate);
++        }
+     }
+ 
+     public void copyArea(BoundingBox p_193243_, Vec3i p_193244_) {
+@@ -257,30 +_,52 @@
+     }
+ 
+     public void copyAreaFrom(LevelTicks<T> p_265554_, BoundingBox p_265172_, Vec3i p_265318_) {
+-        List<ScheduledTick<T>> list = new ArrayList<>();
+-        Predicate<ScheduledTick<T>> predicate = p_200922_ -> p_265172_.isInside(p_200922_.pos());
+-        p_265554_.alreadyRunThisTick.stream().filter(predicate).forEach(list::add);
+-        p_265554_.toRunThisTick.stream().filter(predicate).forEach(list::add);
+-        p_265554_.forContainersInArea(p_265172_, (p_200931_, p_200932_) -> p_200932_.getAll().filter(predicate).forEach(list::add));
+-        LongSummaryStatistics longsummarystatistics = list.stream().mapToLong(ScheduledTick::subTickOrder).summaryStatistics();
+-        long i = longsummarystatistics.getMin();
+-        long j = longsummarystatistics.getMax();
+-        list.forEach(
+-            p_193260_ -> this.schedule(
+-                    new ScheduledTick<>(
+-                        p_193260_.type(),
+-                        p_193260_.pos().offset(p_265318_),
+-                        p_193260_.triggerTick(),
+-                        p_193260_.priority(),
+-                        p_193260_.subTickOrder() - i + j + 1L
++        // MCMT: source and destination can be two different levels' LevelTicks (CloneCommands), so this
++        // needs both instances' locks held for the duration -- mcmtOrderedLock guarantees a consistent
++        // global acquisition order between any two instances, so two concurrent clone commands targeting
++        // the same pair of levels in opposite directions can't deadlock.
++        mcmtOrderedLock(this, p_265554_, () -> {
++            List<ScheduledTick<T>> list = new ArrayList<>();
++            Predicate<ScheduledTick<T>> predicate = p_200922_ -> p_265172_.isInside(p_200922_.pos());
++            p_265554_.alreadyRunThisTick.stream().filter(predicate).forEach(list::add);
++            p_265554_.toRunThisTick.stream().filter(predicate).forEach(list::add);
++            p_265554_.forContainersInArea(p_265172_, (p_200931_, p_200932_) -> p_200932_.getAll().filter(predicate).forEach(list::add));
++            LongSummaryStatistics longsummarystatistics = list.stream().mapToLong(ScheduledTick::subTickOrder).summaryStatistics();
++            long i = longsummarystatistics.getMin();
++            long j = longsummarystatistics.getMax();
++            list.forEach(
++                p_193260_ -> this.scheduleLocked(
++                        new ScheduledTick<>(
++                            p_193260_.type(),
++                            p_193260_.pos().offset(p_265318_),
++                            p_193260_.triggerTick(),
++                            p_193260_.priority(),
++                            p_193260_.subTickOrder() - i + j + 1L
++                        )
+                     )
+-                )
+-        );
++            );
++        });
++    }
++
++    // MCMT: copyAreaFrom already holds this.mcmtLock (via mcmtOrderedLock) when it needs to schedule --
++    // calling the public schedule() there would re-acquire the same lock, which is safe (it's
++    // reentrant) but would also re-read allContainers under a redundant lock/unlock pair. This variant
++    // assumes the lock is already held and go straight to the container lookup.
++    private void scheduleLocked(ScheduledTick<T> p_scheduledTick) {
++        long i = ChunkPos.asLong(p_scheduledTick.pos());
++        LevelChunkTicks<T> levelchunkticks = this.allContainers.get(i);
++        if (levelchunkticks == null) {
++            Util.pauseInIde(new IllegalStateException("Trying to schedule tick in not loaded position " + p_scheduledTick.pos()));
++        } else {
++            levelchunkticks.schedule(p_scheduledTick);
++        }
+     }
+ 
+     @Override
+     public int count() {
+-        return this.allContainers.values().stream().mapToInt(TickAccess::count).sum();
++        synchronized (this.mcmtLock) { // MCMT hook H1/H2/H3
++            return this.allContainers.values().stream().mapToInt(TickAccess::count).sum();
++        }
+     }
+ 
+     @FunctionalInterface
