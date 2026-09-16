@@ -199,6 +199,9 @@ neoDev {
 
     atm10smoke {
             server()
+            // Match the real ATM10Serv install's user_jvm_args.txt (-Xmx8G) -- the default dev-launch
+            // heap is far smaller and OOMs part-way through loading the real 1.8G world with 455 mods.
+            jvmArguments.addAll('-Xms4G', '-Xmx8G', '-Xlog:gc*:file=gc.log:time,level,tags:filecount=0')
     }
 
     gameTestServer {
