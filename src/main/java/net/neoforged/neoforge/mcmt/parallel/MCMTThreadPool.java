@@ -74,7 +74,9 @@ public final class MCMTThreadPool {
         LOGGER.info("MCMT: starting tick worker pool, parallelism {}, hard thread cap {}", parallelism, maxThreads);
         return new ForkJoinPool(
                 parallelism,
-                p -> new MCMTWorkerThread(p, "MCMT-Worker-" + THREAD_ID.getAndIncrement()),
+                // The name deliberately contains "server" -- see MCMTWorkerThread's class doc -- for mods that
+                // gate off-main-thread mutation on a Thread.getName() check rather than the thread group.
+                p -> new MCMTWorkerThread(p, "MCMT-Server-Worker-" + THREAD_ID.getAndIncrement()),
                 (thread, throwable) -> LOGGER.error("MCMT: uncaught exception on {}", thread.getName(), throwable),
                 false,
                 parallelism,
