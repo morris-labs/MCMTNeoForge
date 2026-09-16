@@ -89,6 +89,73 @@
      }
  
      void startTicking(T p_157565_) {
+@@ -142,26 +_,46 @@
+             this.ensureChunkQueuedForLoad(i);
+         }
+ 
+-        this.sectionStorage.getExistingSectionsInChunk(i).forEach(p_157545_ -> {
+-            Visibility visibility = p_157545_.updateChunkStatus(p_157529_);
+-            boolean flag = visibility.isAccessible();
+-            boolean flag1 = p_157529_.isAccessible();
+-            boolean flag2 = visibility.isTicking();
+-            boolean flag3 = p_157529_.isTicking();
+-            if (flag2 && !flag3) {
+-                p_157545_.getEntities().filter(p_157603_ -> !p_157603_.isAlwaysTicking()).forEach(this::stopTicking);
+-            }
+-
+-            if (flag && !flag1) {
+-                p_157545_.getEntities().filter(p_157601_ -> !p_157601_.isAlwaysTicking()).forEach(this::stopTracking);
+-            } else if (!flag && flag1) {
+-                p_157545_.getEntities().filter(p_157599_ -> !p_157599_.isAlwaysTicking()).forEach(this::startTracking);
+-            }
+-
+-            if (!flag2 && flag3) {
+-                p_157545_.getEntities().filter(p_157597_ -> !p_157597_.isAlwaysTicking()).forEach(this::startTicking);
+-            }
+-        });
++        // MCMT hook H2: this loop reads a section's old Visibility, compares it against the chunk's new one, and
++        // conditionally calls stopTracking/startTracking/stopTicking/startTicking for every entity in the
++        // section -- the same shape as Callback.onRemoveLocked and Callback.onSectionChangeLocked below, which
++        // do the identical comparison for one entity at a time and already run under mcmtStructuralLock. This
++        // loop did not, even though ChunkMap.onChunkStatusChange calls it from a pool worker draining the chunk
++        // source's main-thread queue (see the chunkVisibility/chunkLoadStatuses comment above) -- so it could
++        // interleave with a concurrent Callback.onRemoveLocked call on an entity in the same section. Interleaved
++        // just right, both sides read a stale Visibility: the entity's own removal sees the chunk already
++        // demoted and skips stopTracking because a whole-section demotion "must have already handled it," while
++        // this loop's getExistingSectionsInChunk(i) snapshot -- taken after the entity's onRemoveLocked already
++        // pulled it out of the section -- never iterates that entity either. Neither side calls stopTracking, so
++        // the entity never leaves EntityLookup.byUuid/byId even though it is gone from every section a live
++        // query walks: invisible to every in-game entity lookup, permanently reachable from a HashMap the GC
++        // can never collect. Confirmed by heap-dump reverse-reference tracing on a live leak: every orphaned
++        // Piglin/ZombifiedPiglin instance traced back to exactly this EntityLookup#byUuid map, with no other
++        // referrer. Taking the same lock this method's per-entity sibling already uses closes the gap: a
++        // section's whole-chunk transition and a single entity's remove/move can no longer interleave, so
++        // exactly one side always sees the pairing through and calls stopTracking.
++        synchronized (this.mcmtStructuralLock) {
++            this.sectionStorage.getExistingSectionsInChunk(i).forEach(p_157545_ -> {
++                Visibility visibility = p_157545_.updateChunkStatus(p_157529_);
++                boolean flag = visibility.isAccessible();
++                boolean flag1 = p_157529_.isAccessible();
++                boolean flag2 = visibility.isTicking();
++                boolean flag3 = p_157529_.isTicking();
++                if (flag2 && !flag3) {
++                    p_157545_.getEntities().filter(p_157603_ -> !p_157603_.isAlwaysTicking()).forEach(this::stopTicking);
++                }
++
++                if (flag && !flag1) {
++                    p_157545_.getEntities().filter(p_157601_ -> !p_157601_.isAlwaysTicking()).forEach(this::stopTracking);
++                } else if (!flag && flag1) {
++                    p_157545_.getEntities().filter(p_157599_ -> !p_157599_.isAlwaysTicking()).forEach(this::startTracking);
++                }
++
++                if (!flag2 && flag3) {
++                    p_157545_.getEntities().filter(p_157597_ -> !p_157597_.isAlwaysTicking()).forEach(this::startTicking);
++                }
++            });
++        }
+     }
+ 
+     private void ensureChunkQueuedForLoad(long p_157556_) {
 @@ -228,7 +_,10 @@
      private void processPendingLoads() {
          ChunkEntities<T> chunkentities;
