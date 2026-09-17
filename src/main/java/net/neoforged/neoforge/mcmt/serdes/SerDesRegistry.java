@@ -15,6 +15,7 @@ import net.neoforged.neoforge.mcmt.serdes.filter.AutoFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.ConfigFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.DefaultFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.EntityFilter;
+import net.neoforged.neoforge.mcmt.serdes.filter.ExperienceOrbFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.HopperFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.ItemEntityFilter;
 import net.neoforged.neoforge.mcmt.serdes.filter.ModdedHopperFilter;
@@ -33,9 +34,9 @@ import net.neoforged.neoforge.mcmt.serdes.pools.SingleExecutionPool;
  * <p>Filters are consulted in priority order and the first opinion wins:
  *
  * <ol>
- * <li>{@link PistonFilter}, {@link HopperFilter}, {@link ModdedHopperFilter}, {@link ItemEntityFilter} and
- * {@link EntityFilter} — classes known to reach outside themselves, vanilla or modded. Not overridable, because
- * overriding them does not make them safe.
+ * <li>{@link PistonFilter}, {@link HopperFilter}, {@link ModdedHopperFilter}, {@link ItemEntityFilter},
+ * {@link ExperienceOrbFilter} and {@link EntityFilter} — classes known to reach outside themselves, vanilla or
+ * modded. Not overridable, because overriding them does not make them safe.
  * <li>{@link ConfigFilter} — the server owner's white and black lists.
  * <li>{@link AutoFilter} — classes that have already thrown once while running in parallel.
  * <li>{@link VanillaFilter} — everything else in {@code net.minecraft}, per {@code vanillaDefault}.
@@ -81,6 +82,7 @@ public final class SerDesRegistry {
             new HopperFilter(POS_LOCK),
             new ModdedHopperFilter(POS_LOCK),
             new ItemEntityFilter(POS_LOCK),
+            new ExperienceOrbFilter(POS_LOCK),
             new EntityFilter(SINGLE),
             new ConfigFilter(CHUNK_LOCK, SINGLE),
             AUTO,
