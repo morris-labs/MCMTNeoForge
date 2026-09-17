@@ -115,11 +115,6 @@ dependencies {
     libraries "net.jodah:typetools:${project.typetools_version}"
     libraries "net.minecrell:terminalconsoleappender:${project.terminalconsoleappender_version}"
     libraries("net.fabricmc:sponge-mixin:${project.mixin_version}") { transitive = false }
-    // Dev-run-only: production installs get this from mods that jar-in-jar it, and the
-    // dev sandbox's mod-jar extraction runs too late for FML's early MixinExtras module-read
-    // check. Not part of the production libraries/ layout (verified against a real ATM10
-    // server install); safe to add here since neoDev runs never ship this config.
-    libraries "io.github.llamalad7:mixinextras-neoforge:${project.mixin_extras_version}"
     libraries "org.openjdk.nashorn:nashorn-core:${project.nashorn_core_version}"
     libraries ("net.neoforged:JarJarSelector:${project.jarjar_version}") {
         exclude group: 'org.slf4j'
@@ -131,6 +126,23 @@ dependencies {
     }
 
     compileOnly "org.jetbrains:annotations:${project.jetbrains_annotations_version}"
+    // Compile-time only: the mcmt/modmixins classes (root project's src/main/java, compiled as
+    // part of this project -- see the sourceSets block above) use MixinExtras' @WrapOperation
+    // etc. annotations, so javac needs the class on its compile classpath. Deliberately NOT a
+    // `libraries`/`moduleLibraries` declaration: both of those feed `launcherProfileClasspath`
+    // (see NeoDevConfigurations.java), which is what both the production installer's declared-
+    // library manifest and the real launch classpath are built from -- so either one puts this
+    // jar on the module path as its own standalone source, alongside the identical copy every
+    // mod that jar-in-jars this dependency already provides (confirmed: stock NeoForge relies on
+    // exactly that, with no top-level library declaration of its own, and boots fine). Declaring
+    // it a library here means the module path is fed the same jar from two sources at once,
+    // both claiming the automatic module name `mixinextras.neoforge` -- crashes boot with `reads
+    // more than one module named mixinextras.neoforge`. Root-caused against a real live ATM10
+    // server cutover attempt; see STATUS.md. (This means :neoforge:runAtm10smoke and other dev
+    // sandbox runs that load a mod touching MixinExtras classes very early, e.g. ars_nouveau's
+    // mixin plugin, may fail with NoClassDefFoundError until ModDevGradle offers a way to add a
+    // dev-run-only module-path entry -- a real, currently-unresolved gap; see STATUS.md.)
+    compileOnly "io.github.llamalad7:mixinextras-neoforge:${project.mixin_extras_version}"
 
     // Real ATM10 mod jars, so mcmt/modmixins classes can @Shadow their fields and methods.
     compileOnly files(
