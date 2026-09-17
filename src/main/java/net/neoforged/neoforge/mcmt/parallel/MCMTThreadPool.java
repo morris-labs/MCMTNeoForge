@@ -72,11 +72,17 @@ public final class MCMTThreadPool {
         int maxThreads = Math.max(parallelism, MCMTConfig.getMaxPoolSize());
         maxPoolSize = maxThreads;
         LOGGER.info("MCMT: starting tick worker pool, parallelism {}, hard thread cap {}", parallelism, maxThreads);
+        // Captured once, from whoever calls get() first (MCMTBootstrap builds the pool eagerly on
+        // ServerAboutToStartEvent, on the main server thread, specifically so this is FML's transforming
+        // classloader rather than whatever an on-demand compensation thread would otherwise inherit). Every
+        // worker this factory ever creates -- including later compensation workers -- gets this same
+        // classloader explicitly; see MCMTWorkerThread's class doc for why that matters.
+        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
         return new ForkJoinPool(
                 parallelism,
                 // The name deliberately contains "server" -- see MCMTWorkerThread's class doc -- for mods that
                 // gate off-main-thread mutation on a Thread.getName() check rather than the thread group.
-                p -> new MCMTWorkerThread(p, "MCMT-Server-Worker-" + THREAD_ID.getAndIncrement()),
+                p -> new MCMTWorkerThread(p, "MCMT-Server-Worker-" + THREAD_ID.getAndIncrement(), contextClassLoader),
                 (thread, throwable) -> LOGGER.error("MCMT: uncaught exception on {}", thread.getName(), throwable),
                 false,
                 parallelism,

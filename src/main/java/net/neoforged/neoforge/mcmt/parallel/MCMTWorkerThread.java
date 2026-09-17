@@ -30,12 +30,28 @@ import net.neoforged.fml.util.thread.SidedThreadGroups;
  * MCMT-ticked storage block entity never marked itself dirty for saving. The worker's name also deliberately
  * contains "server" for the same reason, against mods that check the thread's name instead of its group (see
  * the constructor below).
+ *
+ * <p>The context classloader is set explicitly, to whatever the main server thread's was when the pool was
+ * built ({@link MCMTThreadPool#create}), rather than left to whatever a plain {@code false} would inherit.
+ * {@code ForkJoinWorkerThread}'s constructor with {@code useSystemClassLoader=false} does not call
+ * {@code setContextClassLoader} at all -- a new worker's context classloader is then whatever {@code Thread}'s
+ * own constructor inherits from the thread that happened to be creating it, which for a {@code ForkJoinPool}
+ * is not reliably the main server thread. A compensation worker in particular (see {@link MCMTThreadPool}'s
+ * class doc on the hard thread cap) can be spun up from inside the pool's own internals while another worker
+ * is blocked, inheriting from an unpredictable ancestor rather than from FML's transforming classloader.
+ * Found via a real instance: a {@code ServiceLoader.load(Class)} call inside Curios (the single-arg overload,
+ * which resolves providers against the calling thread's context classloader) ran on a worker whose context
+ * classloader was not FML's, found zero providers, and threw from a class's static initializer -- which
+ * poisons that class with {@code NoClassDefFoundError} for every thread, forever, for the rest of the JVM's
+ * life. Any mod's {@code ServiceLoader} call from a hot tick path is equally exposed; this is a general fix,
+ * not a Curios-specific one.
  */
 public final class MCMTWorkerThread extends ForkJoinWorkerThread {
-    MCMTWorkerThread(ForkJoinPool pool, String name) {
-        // false: do not force the system classloader, matching the context-classloader behavior of the plain
-        // single-arg super(pool) constructor this replaces.
+    MCMTWorkerThread(ForkJoinPool pool, String name, ClassLoader contextClassLoader) {
+        // false: do not force the system classloader. See the context-classloader note above -- this
+        // constructor sets the correct one explicitly instead of relying on what `false` would inherit.
         super(SidedThreadGroups.SERVER, pool, false);
         this.setName(name);
+        this.setContextClassLoader(contextClassLoader);
     }
 }
