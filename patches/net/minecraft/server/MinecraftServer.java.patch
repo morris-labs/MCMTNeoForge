@@ -188,9 +188,21 @@
              GameTestTicker.SINGLETON.tick();
          }
  
-@@ -1043,11 +_,17 @@
+@@ -1042,12 +_,29 @@
+         this.profiler.pop();
      }
  
++    // MCMT hook H1: the tickChildren loop no longer measures a level tick itself, because under parallel
++    // dispatch it would be measuring how long the handoff took. MCMT calls this with the real duration once
++    // the tick has actually finished. Defined here, immediately after tickChildren and before
++    // reloadResources, rather than near the other MCMT hooks further down this file: moving this method's
++    // lambda past reloadResources shifted javac's per-class lambda-ordinal numbering for every lambda inside
++    // reloadResources by one, which broke third-party mixins (moonlight, KubeJS) that target
++    // reloadResources's compiler-synthesized lambda methods by their exact, hardcoded ordinal name.
++    private void mcmtRecordLevelTickTime(ServerLevel level, long nanos) {
++        perWorldTickTimes.computeIfAbsent(level.dimension(), k -> new long[100])[this.tickCount % 100] = nanos;
++    }
++
      private void synchronizeTime(ServerLevel p_276371_) {
 -        this.playerList
 -            .broadcastAll(
@@ -258,7 +270,7 @@
              return configureRepositoryWithSelection(p_248681_, set, featureflagset, true);
          }
      }
-@@ -1707,11 +_,57 @@
+@@ -1707,11 +_,50 @@
      }
  
      public ProfilerFiller getProfiler() {
@@ -271,13 +283,6 @@
          return this.profiler;
      }
  
-+    // MCMT hook H1: the tickChildren loop no longer measures a level tick itself, because under parallel
-+    // dispatch it would be measuring how long the handoff took. MCMT calls this with the real duration once
-+    // the tick has actually finished.
-+    private void mcmtRecordLevelTickTime(ServerLevel level, long nanos) {
-+        perWorldTickTimes.computeIfAbsent(level.dimension(), k -> new long[100])[this.tickCount % 100] = nanos;
-+    }
-+
 +    @Override
 +    public boolean isSameThread() {
 +        // MCMT hook H5: a worker running a level tick is, for every purpose this check exists to serve, the

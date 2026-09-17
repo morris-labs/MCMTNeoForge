@@ -446,6 +446,29 @@ public final class MCMT {
         return new TickBatch(true);
     }
 
+    /**
+     * True when {@code Level.tickBlockEntities} may call {@code blockEntity.tick()} directly instead of going
+     * through {@link #callBlockEntityTick} -- the literal call site a third-party mixin needs (see the
+     * comment at that call site).
+     *
+     * <p>{@code batch.isInline()} alone is not enough: it says H3 is not dispatching to the pool for
+     * <em>this</em> level, but {@link SerDesRegistry}'s pools -- {@code SingleExecutionPool} above all -- are
+     * shared across hooks and levels by design, so a class routed to one (a chunk lock, a position lock, or
+     * the whole-server single-execution lock an owner can opt a class into with {@code
+     * blockEntitySingleThreadList}, which serialises it against {@code entitySingleThreadList} classes on
+     * purpose) can still need to serialise against a concurrently-dispatched entity tick or another level's
+     * block entities even while this level's own H3 batch is inline (H3 disabled alone while H1/H2/H4 stay
+     * on is a supported config, not a hypothetical). Calling {@code tick()} unlocked in that case would
+     * reopen exactly the cross-entity-state hazard class this project has repeatedly hit (see MCMT-PLAN.md
+     * and the workspace CLAUDE.md's "Cross-entity-state hazard class" note). So the literal call is safe only
+     * when the batch is inline <em>and</em> the block entity has no pool at all -- meaning nothing anywhere
+     * would have serialised or demoted it either way.
+     */
+    public static boolean isPlainBlockEntityTick(TickBatch batch, TickingBlockEntity blockEntity) {
+        return batch.isInline()
+                && SerDesRegistry.poolFor(SerDesHookType.BLOCK_ENTITY_TICK, blockEntity.mcmtTickedType()) == null;
+    }
+
     /** Hook H3. Ticks one block entity into the batch; from the loop in {@code Level.tickBlockEntities}. */
     public static void callBlockEntityTick(TickBatch batch, TickingBlockEntity blockEntity, Level level) {
         Class<?> type = blockEntity.mcmtTickedType();

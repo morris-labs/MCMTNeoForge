@@ -41,14 +41,22 @@
      @Deprecated
      private final RandomSource threadSafeRandom = RandomSource.createThreadSafe();
      private final Holder<DimensionType> dimensionTypeRegistration;
-@@ -114,6 +_,11 @@
+@@ -114,6 +_,19 @@
      private final RegistryAccess registryAccess;
      private final DamageSources damageSources;
      private long subTickCount;
 +    public boolean restoringBlockSnapshots = false;
 +    public boolean captureBlockSnapshots = false;
 +    public java.util.ArrayList<net.neoforged.neoforge.common.util.BlockSnapshot> capturedBlockSnapshots = new java.util.ArrayList<>();
-+    private final java.util.ArrayList<BlockEntity> freshBlockEntities = new java.util.ArrayList<>();
++    // Declared as List, not ArrayList, so the isEmpty() check below compiles to an
++    // invokeinterface java/util/List.isEmpty() call. That's a real, load-bearing property of this
++    // field's type, not decoration: a third-party mixin (a furniture mod's block-entity mixin, in
++    // the wild) targets the first List.isEmpty() call in tickBlockEntities() by ordinal, matching
++    // stock NeoForge's own pendingBlockEntityTickers check before MCMT's H3 patch changed that
++    // field to a Queue. This field's own isEmpty() check, below, is the field left in this method
++    // whose static type can restore that call shape without reverting pendingBlockEntityTickers's
++    // concurrency-motivated Queue type. See MCMT hook H3's other tickBlockEntities() comment.
++    private final List<BlockEntity> freshBlockEntities = new java.util.ArrayList<>();
 +    private final java.util.Queue<BlockEntity> pendingFreshBlockEntities = new java.util.concurrent.ConcurrentLinkedQueue<>(); // MCMT hook H3: see pendingBlockEntityTickers
  
      protected Level(
@@ -113,7 +121,7 @@
      }
  
      public void updateNeighborsAtExceptFromFacing(BlockPos p_46591_, Block p_46592_, Direction p_46593_) {
-@@ -489,10 +_,32 @@
+@@ -489,10 +_,36 @@
          (this.tickingBlockEntities ? this.pendingBlockEntityTickers : this.blockEntityTickers).add(p_151526_);
      }
  
@@ -133,6 +141,10 @@
 +            this.pendingFreshBlockEntities.clear();
 +        }
          this.tickingBlockEntities = true;
++        // MCMT hook H3: this call is also the mixin-compat List.isEmpty() call site -- see
++        // freshBlockEntities's own field comment above. Keep freshBlockEntities List-typed and
++        // this check as the first thing after tickingBlockEntities flips true, so ordinal 0 stays
++        // both a real check and the earliest point in the active tick pass.
 +        if (!this.freshBlockEntities.isEmpty()) {
 +            this.freshBlockEntities.forEach(blockEntity -> {
 +                // Only call onLoad() on BEs which have been fully added to the level, prevents crashes with BEs that
@@ -146,11 +158,20 @@
          if (!this.pendingBlockEntityTickers.isEmpty()) {
              this.blockEntityTickers.addAll(this.pendingBlockEntityTickers);
              this.pendingBlockEntityTickers.clear();
-@@ -500,28 +_,39 @@
+@@ -500,28 +_,52 @@
  
          Iterator<TickingBlockEntity> iterator = this.blockEntityTickers.iterator();
          boolean flag = this.tickRateManager().runsNormally();
 +        net.neoforged.neoforge.mcmt.TickBatch mcmtBatch = net.neoforged.neoforge.mcmt.MCMT.startBlockEntityTicks(this); // MCMT hook H3
++        // MCMT hook H3: keep a literal `TickingBlockEntity.tick()` call site in this method for the case where
++        // nothing is actually dispatched to a worker. A Mixin `@Redirect`/`@Inject` injector scans only the
++        // compiled bytecode of the method it targets, not wherever MCMT.callBlockEntityTick eventually calls
++        // tick() -- so a third-party mixin that targets this exact call (a lag-profiling mod, in the wild)
++        // finds zero matches and fails to load unless that call shape still exists somewhere in
++        // tickBlockEntities() itself. The literal call is only safe for a block entity that has no SerDes
++        // pool at all -- see MCMT.isPlainBlockEntityTick, which also covers the case this level's own H3
++        // batch is inline but the pool it would have used is shared with a concurrently-dispatched hook or
++        // level (SingleExecutionPool above all).
  
          while (iterator.hasNext()) {
              TickingBlockEntity tickingblockentity = iterator.next();
@@ -158,7 +179,11 @@
                  iterator.remove();
              } else if (flag && this.shouldTickBlocksAt(tickingblockentity.getPos())) {
 -                tickingblockentity.tick();
-+                net.neoforged.neoforge.mcmt.MCMT.callBlockEntityTick(mcmtBatch, tickingblockentity, this); // MCMT hook H3
++                if (net.neoforged.neoforge.mcmt.MCMT.isPlainBlockEntityTick(mcmtBatch, tickingblockentity)) {
++                    tickingblockentity.tick(); // MCMT hook H3: literal call, preserved for mixin compat (see above)
++                } else {
++                    net.neoforged.neoforge.mcmt.MCMT.callBlockEntityTick(mcmtBatch, tickingblockentity, this); // MCMT hook H3
++                }
              }
          }
  

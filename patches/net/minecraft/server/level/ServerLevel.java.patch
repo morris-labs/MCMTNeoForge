@@ -250,17 +250,21 @@
              String s = "recursive call to sendBlockUpdated";
              Util.logAndPauseIfInIde("recursive call to sendBlockUpdated", new IllegalStateException("recursive call to sendBlockUpdated"));
          }
-@@ -1036,7 +_,15 @@
+@@ -1036,7 +_,19 @@
          if (Shapes.joinIsNotEmpty(voxelshape1, voxelshape, BooleanOp.NOT_SAME)) {
              List<PathNavigation> list = new ObjectArrayList<>();
  
 -            for (Mob mob : this.navigatingMobs) {
 +            // MCMT: navigatingMobs is a plain ObjectOpenHashSet and onTrackingStart/onTrackingEnd add and
 +            // remove from workers. Snapshot under its monitor; shouldRecomputePath is cheap (no pathfinding)
-+            // and safe to leave outside the lock.
-+            List<Mob> navigating;
++            // and safe to leave outside the lock. The snapshot is a Set, not a List: Immersive Engineering's
++            // ServerWorldMixin injects into this method at a literal Set.iterator() call, and a List snapshot
++            // silently deletes that call site (the mixin then fails its injection check at mod-load time).
++            // A Set snapshot restores the original bytecode shape with no change to the locking or the
++            // one-full-copy-under-the-monitor semantics below.
++            Set<Mob> navigating;
 +            synchronized (this.navigatingMobs) {
-+                navigating = new ObjectArrayList<>(this.navigatingMobs);
++                navigating = new ObjectOpenHashSet<>(this.navigatingMobs);
 +            }
 +
 +            for (Mob mob : navigating) {
